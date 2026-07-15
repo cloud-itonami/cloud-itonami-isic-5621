@@ -1,0 +1,12 @@
+[{:itonami.blueprint/id "cloud-itonami-isic-5621"
+  :itonami.blueprint/name "Event Catering"
+  :itonami.blueprint/isic-rev4 "5621"
+  :itonami.blueprint/domain :services/event-catering
+  :itonami.blueprint/license "AGPL-3.0-or-later"
+  :itonami.blueprint/social-impact [:food-safety :guest-experience :small-business-support :community-events]
+  :itonami.blueprint/governor :catering-governor
+  :itonami.blueprint/robotics false
+  :itonami.blueprint/required-technologies [:identity :forms :dmn :bpmn :audit-ledger]
+  :itonami.blueprint/status :public-oss
+  :itonami.blueprint/maturity :implemented
+  :db/id -1}]

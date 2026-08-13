@@ -19,10 +19,18 @@
   render time (see `approver-probe`) rather than asserted, so it cannot
   turn into a stale claim if the store changes.
 
-  Build-time invariant: `-main` THROWS unless the real governor produced
-  at least one `:governor-hold` fact AND the run covered every HARD rule
-  in `expected-hard-rules`. A console that silently renders zero holds
-  would look identical to one where the governor stopped working.
+  Build-time invariants: `-main` THROWS unless (1) the real governor
+  produced at least one `:governor-hold` fact, (2) the run covered every
+  HARD rule in `expected-hard-rules`, and (3) every `:governor-hold` fact
+  is classified into exactly one rendered class. A console that silently
+  renders zero holds would look identical to one where the governor
+  stopped working; one that counts a hold in a heading but drops its row
+  is the same failure a size smaller.
+
+  Two hold classes, deliberately NOT merged (see `hard-hold?`):
+  a HARD governor violation is permanent and un-overridable, while a
+  `:phase-disabled` rollout-phase block is lifted by a later phase.
+  `cateringops.operation` emits both as `:t :governor-hold`.
 
   Deterministic: no timestamps, no randomness, sets are sorted before
   rendering -- two consecutive runs are byte-identical.
@@ -182,6 +190,18 @@
                     :venue "Acme Corp atrium"}}
            coordinator-p3)
 
+    ;; --- order-2: governor-CLEAN, but the op is not writable at phase 1.
+    ;; The phase gate alone holds it (`:phase-reason :phase-disabled`), so the
+    ;; resulting fact carries an EMPTY :violations vector. A distinct hold
+    ;; class from a HARD governor block -- rendered separately below, because
+    ;; calling a rollout-phase block a "HARD, un-overridable" one would
+    ;; misstate what the actor did.
+    (exec! actor "o2-supply-p1"
+           {:op :coordinate-supply-order :order-id "order-2"
+            :patch {:item "insulated hot-hold cabinets" :quantity 6
+                    :estimated-cost 900}}
+           coordinator-p1)
+
     ;; --- order-2: escalated concern flag the human REJECTS
     (exec! actor "o2-safety-flag"
            {:op :flag-food-safety-concern :order-id "order-2"
@@ -276,15 +296,39 @@
 (defn- last-fact-for [ledger order-id]
   (last (filter #(= (:order-id %) order-id) ledger)))
 
+(defn hard-hold?
+  "`cateringops.operation` emits `:t :governor-hold` for BOTH a HARD
+  governor violation and a mere rollout-phase block (`phase/gate`
+  returning `:phase-disabled` on an otherwise governor-clean proposal).
+  Only the former carries `:violations`. Distinguished here rather than
+  conflated: a phase block is a rollout milestone that a later phase
+  lifts, while a HARD hold is permanent and un-overridable -- labelling
+  the first as the second would misstate what the actor did."
+  [f]
+  (and (= :governor-hold (:t f)) (boolean (seq (:violations f)))))
+
+(defn phase-hold?
+  "A `:governor-hold` the ROLLOUT PHASE produced, not the governor: no
+  violations, but a `:phase-reason`."
+  [f]
+  (and (= :governor-hold (:t f))
+       (empty? (:violations f))
+       (some? (:phase-reason f))))
+
 (defn- status-cell [ledger order-id]
   (let [f (last-fact-for ledger order-id)]
-    (case (:t f)
-      nil                 "<span class=\"muted\">no activity this run</span>"
-      :committed          "<span class=\"ok\">committed</span>"
-      :governor-hold      (str "<span class=\"critical\">HARD hold &middot; "
-                               (esc (basis-str (:basis f))) "</span>")
-      :approval-rejected  "<span class=\"err\">approval rejected &middot; held</span>"
-      (str "<span class=\"muted\">" (esc (kw-str (:t f))) "</span>"))))
+    (cond
+      (nil? f) "<span class=\"muted\">no activity this run</span>"
+      (hard-hold? f) (str "<span class=\"critical\">HARD hold &middot; "
+                          (esc (basis-str (:basis f))) "</span>")
+      (phase-hold? f) (str "<span class=\"warn\">phase hold &middot; "
+                           (esc (kw-str (:phase-reason f)))
+                           " (phase " (esc (:phase f)) ")</span>")
+      :else
+      (case (:t f)
+        :committed          "<span class=\"ok\">committed</span>"
+        :approval-rejected  "<span class=\"err\">approval rejected &middot; held</span>"
+        (str "<span class=\"muted\">" (esc (kw-str (:t f))) "</span>")))))
 
 (defn- order-row [ledger {:keys [order-id client registered? verified?]}]
   (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
@@ -357,13 +401,27 @@
                       (esc (kw-str rule)) (esc (name op)) (esc order-id)
                       (esc detail) (esc confidence)))))
 
+;; --- rollout-phase holds (governor-clean, blocked by the phase gate) ---
+
+(defn- phase-hold-row [{:keys [op order-id phase phase-reason confidence]}]
+  (format "        <tr><td><code>%s</code></td><td><code>:%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+          (esc (kw-str phase-reason)) (esc (name op)) (esc order-id)
+          (esc phase)
+          (esc confidence)))
+
 ;; --- audit ledger ---
 
-(defn- ledger-row [{:keys [t op order-id disposition basis by]}]
+(defn- ledger-row [{:keys [t op order-id disposition basis by phase-reason]}]
   (format "        <tr><td>%s</td><td><code>:%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
           (esc (kw-str t)) (esc (name (or op :n-a))) (esc order-id)
           (esc (kw-str (or disposition "")))
-          (esc (or by (basis-str basis)))))
+          ;; a rollout-phase hold has no :basis -- fall through to its
+          ;; :phase-reason rather than rendering an empty cell for a
+          ;; fact that does have a reason.
+          (esc (or by
+                   (when (seq basis) (basis-str basis))
+                   (when phase-reason (kw-str phase-reason))
+                   ""))))
 
 (defn- code-paths [paths]
   (if (seq paths)
@@ -452,7 +510,8 @@
   (let [ledger  (vec (store/ledger db))
         orders  (store/all-orders db)
         recs    (vec (store/coordination-log db))
-        holds   (filterv #(= :governor-hold (:t %)) ledger)
+        holds   (filterv hard-hold? ledger)
+        pholds  (filterv phase-hold? ledger)
         probe   (approver-probe db)]
     (str
      "<html lang=\"en\"><head><meta charset=\"utf-8\">"
@@ -541,6 +600,20 @@
      "    </table>\n"
      "  </section>\n"
 
+     ;; 6b. rollout-phase holds -- a DIFFERENT class from the above
+     "  <section class=\"card\">\n"
+     "    <h2>Rollout-phase holds this run</h2>\n"
+     "    <p class=\"muted\">"
+     (count pholds)
+     " proposal(s) the Catering Governor found <em>clean</em>, held anyway because the op is not writable at the phase the request ran under. Unlike a HARD hold these are not permanent — enabling the op in a later phase lifts them. <code>cateringops.operation</code> emits both classes as <code>:t :governor-hold</code>; only the HARD ones carry <code>:violations</code>.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Phase reason</th><th>Requested op</th><th>Order</th><th>Phase</th><th>Advisor confidence</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map phase-hold-row pholds)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
      ;; 7. ledger
      "  <section class=\"card\">\n"
      "    <h2>Audit ledger (this run)</h2>\n"
@@ -556,15 +629,30 @@
      "<footer><p class=\"muted\">Generated by <code>cateringops.render-html</code> from a real "
      "<code>cateringops.operation</code> run — "
      (count ledger) " ledger facts, " (count recs) " committed records, "
-     (count holds) " HARD holds. No hand-written rows.</p></footer>\n"
+     (count holds) " HARD holds, " (count pholds)
+     " rollout-phase holds. No hand-written rows.</p></footer>\n"
      "</body></html>\n")))
 
 (defn -main [& args]
   (let [out (or (first args) "docs/samples/operator-console.html")
         db (run-demo!)
         ledger (store/ledger db)
-        holds (filter #(= :governor-hold (:t %)) ledger)
+        all-holds (filter #(= :governor-hold (:t %)) ledger)
+        holds (filter hard-hold? ledger)
+        pholds (filter phase-hold? ledger)
         rules (set (mapcat :basis holds))]
+    ;; No silent drop: EVERY :governor-hold fact must land in exactly one
+    ;; rendered class. `hold-row` emits one row per violation, so a fact
+    ;; with an empty :violations vector used to render as nothing at all
+    ;; while still being counted in the section heading -- a hold the page
+    ;; claimed to show and did not.
+    (when-not (= (count all-holds) (+ (count holds) (count pholds)))
+      (throw (ex-info "REFUSING to write the console: some :governor-hold fact is in neither the HARD nor the rollout-phase class, so it would be counted but never rendered."
+                      {:governor-hold-facts (count all-holds)
+                       :hard (count holds)
+                       :phase (count pholds)
+                       :unclassified (mapv #(select-keys % [:t :op :order-id :basis :phase-reason])
+                                           (remove (some-fn hard-hold? phase-hold?) all-holds))})))
     ;; Build-time invariants, not comments. A console rendered from a
     ;; governor that stopped firing would look perfectly plausible.
     (when (empty? holds)
@@ -581,4 +669,5 @@
     (println "wrote" out
              "-" (count ledger) "ledger facts,"
              (count (store/coordination-log db)) "committed records,"
-             (count holds) "HARD holds covering" (sort (map name rules)))))
+             (count holds) "HARD holds covering" (sort (map name rules)) ","
+             (count pholds) "rollout-phase holds")))

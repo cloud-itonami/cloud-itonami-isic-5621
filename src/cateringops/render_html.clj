@@ -55,16 +55,31 @@
 
 ;; ----------------------------- the real run -----------------------------
 
+(def ^:private graph-audit
+  "Approval facts the StateGraph itself emitted on its `:audit` channel
+  during this run. Captured because -- as this run MEASURES -- they never
+  reach `store/ledger`: `cateringops.operation`'s `:commit` node appends
+  only its own commit fact, so the `:approval-granted` entry the
+  `:request-approval` node produced dies with the run. Keeping it lets
+  `approver-probe` compare three independent planes instead of two."
+  (atom []))
+
 (defn- exec! [actor tid request context]
   (g/run* actor {:request request :context context} {:thread-id tid}))
 
+(defn- capture! [r]
+  (swap! graph-audit into
+         (filter #(#{:approval-granted :approval-rejected} (:t %))
+                 (get-in r [:state :audit])))
+  r)
+
 (defn- approve! [actor tid by]
-  (g/run* actor {:approval {:status :approved :by by}}
-          {:thread-id tid :resume? true}))
+  (capture! (g/run* actor {:approval {:status :approved :by by}}
+                    {:thread-id tid :resume? true})))
 
 (defn- reject! [actor tid by]
-  (g/run* actor {:approval {:status :rejected :by by}}
-          {:thread-id tid :resume? true}))
+  (capture! (g/run* actor {:approval {:status :rejected :by by}}
+                    {:thread-id tid :resume? true})))
 
 (defn- drifted-op-advisor
   "A compromised/confused advisor that keeps `:effect :propose` (so the
@@ -115,6 +130,7 @@
 
   Returns the store. Every value rendered below is read back out of it."
   []
+  (reset! graph-audit [])
   (let [db (store/seed-db)
         actor (op/build db)]
 
@@ -207,31 +223,39 @@
 
 ;; ----------------------------- measurement -----------------------------
 
+(def ^:private approver-paths
+  "Every key path a committed record could plausibly carry the approver
+  on, given `cateringops.operation/commit-record` writes both `:value`
+  and `:payload`. Probed rather than assumed."
+  [[:value :approved-by] [:payload :approved-by]])
+
 (defn approver-probe
-  "MEASURES, against the store this run actually produced, whether an
-  approving human's identity survives into the committed record.
+  "MEASURES whether an approving human's identity survives this run, on
+  three INDEPENDENT planes, and reports what it found:
 
-  This fleet has repos whose `commit-record!` destructures `:value` and
-  never reads `:payload`, silently dropping the approver. Whether THIS
-  repo does is not assumed here -- it is read back out of
-  `store/coordination-log` and reported. A hardcoded claim would become
-  a lie the day the store changes.
+    1. the StateGraph's own `:audit` channel (`graph-audit`)  -- did the
+       actor ever emit an `:approval-granted` fact at all?
+    2. `store/ledger`                                          -- did that
+       fact reach the durable audit log?
+    3. `store/coordination-log`                                -- did the
+       approver survive onto the committed record, and at which key?
 
-  Returns {:granted n :retained n :paths [[k k] ..] :approvers [..]}."
+  This fleet has sibling repos whose `commit-record!` destructures
+  `:value` and never reads `:payload`, silently dropping the approver.
+  Whether THIS repo does is not assumed here; a hardcoded claim would
+  become a lie the day the store changes."
   [db]
-  (let [granted (filter #(= :approval-granted (:t %)) (store/ledger db))
-        recs (store/coordination-log db)
-        paths [[:value :approved-by] [:payload :approved-by]]
-        hits (for [r recs
-                   p paths
-                   :when (get-in r p)]
-               [p (get-in r p)])]
-    {:granted   (count granted)
-     :retained  (count (distinct (map (fn [r] (some #(when (get-in r %) r) paths))
-                                      (filter (fn [r] (some #(get-in r %) paths)) recs))))
-     :paths     (vec (sort-by str (distinct (map first hits))))
-     :approvers (vec (sort (distinct (map second hits))))
-     :from-audit (vec (sort (distinct (keep :by granted))))}))
+  (let [recs   (store/coordination-log db)
+        hits   (for [r recs, p approver-paths :when (get-in r p)] [p (get-in r p)])
+        gaudit @graph-audit]
+    {:graph-granted   (count (filter #(= :approval-granted (:t %)) gaudit))
+     :graph-rejected  (count (filter #(= :approval-rejected (:t %)) gaudit))
+     :ledger-granted  (count (filter #(= :approval-granted (:t %)) (store/ledger db)))
+     :retained        (count (filter (fn [r] (some #(get-in r %) approver-paths)) recs))
+     :paths           (vec (sort-by str (distinct (map first hits))))
+     :missing-paths   (vec (sort-by str (remove (set (map first hits)) approver-paths)))
+     :approvers       (vec (sort (distinct (map second hits))))
+     :from-graph      (vec (sort (distinct (keep :by gaudit))))}))
 
 ;; ----------------------------- rendering -----------------------------
 
@@ -341,54 +365,85 @@
           (esc (kw-str (or disposition "")))
           (esc (or by (basis-str basis)))))
 
+(defn- code-paths [paths]
+  (if (seq paths)
+    (str/join ", " (map #(str "<code>" (esc (pr-str %)) "</code>") paths))
+    "<span class=\"critical\">none</span>"))
+
 (defn- approver-note
-  "Renders the MEASURED approver-attribution finding. The wording is
-  chosen from what `approver-probe` actually observed, so it stays true
-  if the store's retention behaviour changes."
-  [{:keys [granted retained paths approvers from-audit]}]
-  (cond
-    (zero? granted)
-    "<span class=\"muted\">No approval was granted in this run, so retention could not be measured.</span>"
+  "Renders the MEASURED approver-attribution finding. Every branch below
+  is selected from what `approver-probe` actually observed, so the page
+  cannot keep asserting a defect after someone fixes it (nor keep
+  claiming retention after someone breaks it)."
+  [{:keys [graph-granted ledger-granted retained paths missing-paths from-graph]}]
+  (str
+   (cond
+     (zero? graph-granted)
+     "<span class=\"muted\">No approval was granted anywhere in this run, so retention could not be measured.</span>"
 
-    (zero? retained)
-    (str "<span class=\"critical\">The approver identity is NOT retained in the committed record.</span> "
-         "The store keeps no <code>:approved-by</code> on any committed record, so the names below are "
-         "<strong>audit only &mdash; not retained in record</strong>, recovered by joining the "
-         "<code>:approval-granted</code> ledger facts: "
-         (esc (str/join ", " from-audit)) ".")
+     (zero? retained)
+     (str "<span class=\"critical\">The approver identity is NOT retained in the committed record.</span> "
+          "No committed record carries <code>:approved-by</code> at any probed path, so the names above are "
+          "<strong>audit only &mdash; not retained in record</strong>, recovered from the StateGraph&#39;s own "
+          "<code>:approval-granted</code> facts: " (esc (str/join ", " from-graph)) ".")
 
-    (< retained granted)
-    (str "<span class=\"warn\">Partially retained.</span> " granted
-         " approvals were granted but only " retained
-         " committed records carry the approver (at "
-         (str/join ", " (map #(str "<code>" (esc (pr-str %)) "</code>") paths))
-         "). The remainder are <strong>audit only &mdash; not retained in record</strong>.")
+     (< retained graph-granted)
+     (str "<span class=\"warn\">Partially retained.</span> " graph-granted
+          " approvals were granted but only " retained
+          " committed record(s) carry the approver (at " (code-paths paths)
+          "). The remainder are <strong>audit only &mdash; not retained in record</strong>.")
 
-    :else
-    (str "<span class=\"ok\">Retained.</span> All " granted
-         " approvals granted in this run are recoverable from the committed record itself, at "
-         (str/join ", " (map #(str "<code>" (esc (pr-str %)) "</code>") paths))
-         ". Note this is a property of <code>cateringops.store/MemStore</code>, which conj&#39;s the "
-         "<em>whole</em> record &mdash; the approver rides on <code>:payload</code>, not on "
-         "<code>:value</code>, so a store implementation that destructured only <code>:value</code> "
-         "would drop it silently.")))
+     :else
+     (str "<span class=\"ok\">Retained on the record.</span> All " graph-granted
+          " approvals granted in this run are recoverable from the committed record itself, at "
+          (code-paths paths)
+          ". That is a property of <code>cateringops.store/MemStore</code>, which conj&#39;s the "
+          "<em>whole</em> record: the approver rides on <code>:payload</code>"
+          (when (seq missing-paths)
+            (str " and is absent from " (code-paths missing-paths)))
+          ", so a store implementation that destructured only <code>:value</code> would drop it silently."))
 
-(defn- probe-rows [{:keys [granted retained paths approvers from-audit]}]
+   ;; The ledger plane is reported separately -- it is a different
+   ;; question from record retention, and in this repo the two disagree.
+   " "
+   (cond
+     (zero? graph-granted) ""
+
+     (zero? ledger-granted)
+     (str "<span class=\"warn\">The durable audit ledger, however, records no approval at all.</span> "
+          "<code>cateringops.operation</code>&#39;s <code>:request-approval</code> node emits an "
+          "<code>:approval-granted</code> fact onto the graph&#39;s <code>:audit</code> channel, but the "
+          "<code>:commit</code> node appends only its own <code>:committed</code> fact to "
+          "<code>store/ledger</code> &mdash; so that approval fact dies with the run. Reading the ledger "
+          "alone, an auto-commit and a human-approved commit are indistinguishable; the coordination log "
+          "is the only plane that tells them apart.")
+
+     :else
+     (str "The durable audit ledger independently records " ledger-granted
+          " <code>:approval-granted</code> fact(s), so the ledger plane and the record plane agree."))))
+
+(defn- probe-rows [{:keys [graph-granted graph-rejected ledger-granted retained
+                           paths approvers from-graph]}]
   (str/join
    "\n"
    [(format "        <tr><td>%s</td><td>%s</td></tr>"
-            "<code>:approval-granted</code> ledger facts this run" granted)
+            "approvals granted &mdash; StateGraph <code>:audit</code> channel" graph-granted)
+    (format "        <tr><td>%s</td><td>%s</td></tr>"
+            "approvals rejected &mdash; StateGraph <code>:audit</code> channel" graph-rejected)
+    (format "        <tr><td>%s</td><td>%s</td></tr>"
+            "<code>:approval-granted</code> facts in durable <code>store/ledger</code>"
+            (if (zero? ledger-granted)
+              (str "<span class=\"critical\">" ledger-granted "</span>")
+              ledger-granted))
     (format "        <tr><td>%s</td><td>%s</td></tr>"
             "committed records carrying an approver" retained)
     (format "        <tr><td>%s</td><td>%s</td></tr>"
-            "key path(s) the approver was found at"
-            (if (seq paths)
-              (str/join ", " (map #(str "<code>" (esc (pr-str %)) "</code>") paths))
-              "<span class=\"critical\">none</span>"))
+            "key path(s) the approver was found at" (code-paths paths))
     (format "        <tr><td>%s</td><td>%s</td></tr>"
-            "approvers named in the record" (esc (str/join ", " approvers)))
+            "approvers named in the committed record" (esc (str/join ", " approvers)))
     (format "        <tr><td>%s</td><td>%s</td></tr>"
-            "approvers named in the audit ledger" (esc (str/join ", " from-audit)))]))
+            "approvers named in the StateGraph audit"
+            (if (seq from-graph) (esc (str/join ", " from-graph)) "<span class=\"muted\">none</span>"))]))
 
 (defn render
   "Renders the whole document from a store `db` that has already been

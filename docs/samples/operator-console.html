@@ -2526,14 +2526,16 @@ img,svg { max-width: 100%; height: auto; }</style></head><body>
     <table>
       <thead><tr><th>Observation</th><th>Value</th></tr></thead>
       <tbody>
-        <tr><td><code>:approval-granted</code> ledger facts this run</td><td>0</td></tr>
+        <tr><td>approvals granted &mdash; StateGraph <code>:audit</code> channel</td><td>3</td></tr>
+        <tr><td>approvals rejected &mdash; StateGraph <code>:audit</code> channel</td><td>1</td></tr>
+        <tr><td><code>:approval-granted</code> facts in durable <code>store/ledger</code></td><td><span class="critical">0</span></td></tr>
         <tr><td>committed records carrying an approver</td><td>3</td></tr>
         <tr><td>key path(s) the approver was found at</td><td><code>[:payload :approved-by]</code></td></tr>
-        <tr><td>approvers named in the record</td><td>catering-coordinator-1, procurement-lead-1</td></tr>
-        <tr><td>approvers named in the audit ledger</td><td></td></tr>
+        <tr><td>approvers named in the committed record</td><td>catering-coordinator-1, procurement-lead-1</td></tr>
+        <tr><td>approvers named in the StateGraph audit</td><td>catering-coordinator-1, procurement-lead-1</td></tr>
       </tbody>
     </table>
-    <p><span class="muted">No approval was granted in this run, so retention could not be measured.</span></p>
+    <p><span class="ok">Retained on the record.</span> All 3 approvals granted in this run are recoverable from the committed record itself, at <code>[:payload :approved-by]</code>. That is a property of <code>cateringops.store/MemStore</code>, which conj&#39;s the <em>whole</em> record: the approver rides on <code>:payload</code> and is absent from <code>[:value :approved-by]</code>, so a store implementation that destructured only <code>:value</code> would drop it silently. <span class="warn">The durable audit ledger, however, records no approval at all.</span> <code>cateringops.operation</code>&#39;s <code>:request-approval</code> node emits an <code>:approval-granted</code> fact onto the graph&#39;s <code>:audit</code> channel, but the <code>:commit</code> node appends only its own <code>:committed</code> fact to <code>store/ledger</code> &mdash; so that approval fact dies with the run. Reading the ledger alone, an auto-commit and a human-approved commit are indistinguishable; the coordination log is the only plane that tells them apart.</p>
   </section>
   <section class="card">
     <h2>HARD governor holds this run</h2>

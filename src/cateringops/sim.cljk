@@ -1,5 +1,5 @@
 (ns cateringops.sim
-  "Demo driver -- `clojure -M:run`. Walks a clean catering order-record
+  "Demo driver -- `kbb -M:run`. Walks a clean catering order-record
   logging request through intake -> advise -> govern -> decide ->
   approval -> commit at phase 1 (assisted-logging, always approval),
   then re-runs the same op at phase 3 (supervised-auto, clean + high

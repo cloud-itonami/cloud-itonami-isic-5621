@@ -18,7 +18,7 @@
          io.github.kotoba-lang/langchain
          {:local/root "../../kotoba-lang/langchain"}}}
   :run {:main-opts ["-m" "cateringops.sim"]}
-  ;; clojure -M:dev:render-html [out-file]
+  ;; kbb -M:dev:render-html [out-file]
   ;; -> regenerate docs/samples/operator-console.html by actually running
   ;;    cateringops.operation -> governor -> store. Throws if the real
   ;;    governor produced no HARD hold.

@@ -1,7 +1,7 @@
 (ns cateringops.governor-contract-test
   "Integration tests: full OperationActor graph exercising the governor's
   hard checks, escalation logic, and audit trail."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [langgraph.graph :as g]
             [cateringops.advisor :as advisor]
             [cateringops.store :as store]

@@ -37,7 +37,7 @@
 
   Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
-  (:require [jp-go-dds.skin]
+  (:require [kotoba.io :as kio] [jp-go-dds.skin]
             [kotoba.lang.text :as str]
             [cateringops.advisor :as advisor]
             [cateringops.governor :as governor]
@@ -663,8 +663,8 @@
                       {:expected expected-hard-rules
                        :observed rules
                        :missing (remove rules expected-hard-rules)})))
-    (let [f (java.io.File. ^String out)]
-      (when-let [p (.getParentFile f)] (.mkdirs p)))
+    (let [f (kio/file ^String out)]
+      (when-let [p (kio/parent-file f)] (kio/mkdirs p)))
     (spit out (render db))
     (println "wrote" out
              "-" (count ledger) "ledger facts,"
